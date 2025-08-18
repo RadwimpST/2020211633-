@@ -1,243 +1,363 @@
-from __future__ import print_function
+
 import os
+import math
 import argparse
+import random
+from pathlib import Path
+from typing import Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from data import DataLoadAdni
-from model_hierar import model_hierar
-import numpy as np
 from torch.utils.data import DataLoader
-import sklearn.metrics as metrics
-import time
+
+from data import DataLoadAdni
+from model_modular import ModelModular
+from loss_utils import (
+    ce_loss, balance_loss, sharp_loss,
+    intra_compact_loss, inter_separate_loss, empty_module_penalty,
+    schedule_linear, schedule_cosine
+)
 
 
-# 1 init这个函数检查是否存在用于保存日志和模型的目录。如果没有，就创建这些目录。
-def _init_():
-    if not os.path.exists('log'):
-        os.makedirs('log')
-    if not os.path.exists('log/' + args.exp_name):
-        os.makedirs('log/' + args.exp_name)
-    if not os.path.exists('log/' + args.exp_name + '/' + 'models'):
-        os.makedirs('log/' + args.exp_name + '/' + 'models')
+# --------------------------- utils -------------------------------------------
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
-def train(args, fold):
-    # 1参数：args：超参数 fold：交叉验证折数
+def count_classes(dataset) -> int:
+    """Infer number of classes from dataset labels."""
+    # sample all labels (labels are small compared to data)
+    labels = []
+    for i in range(len(dataset)):
+        labels.append(int(dataset[i][1]))
+    classes = int(max(labels)) + 1 if labels else 2
+    return classes
 
-    # python  train.py --partroi 270 --num_pooling 1 --assign_ratio 0.35 --assign_ratio_1 0.35 --mult_num 8
 
-    # 2数据加载：
-    # fold表示当前的折数，shuffle=True表示打乱顺序，drop_last=True表示如果最后一个批次样本不足一个批次，则丢弃
-    train_loader = DataLoader(
-        DataLoadAdni(partition='train', partroi=args.partroi, fold=fold + 1, choose_data=args.data_choose),
-        num_workers=0,
-        batch_size=args.batch_size, shuffle=True, drop_last=True)
-    test_loader = DataLoader(
-        DataLoadAdni(partition='test', partroi=args.partroi, fold=fold + 1, choose_data=args.data_choose),
-        num_workers=0,
-        batch_size=args.test_batch_size, shuffle=True, drop_last=False)
+def build_dataloaders(args) -> Tuple[DataLoader, DataLoader]:
+    train_set = DataLoadAdni(args.choose_data, args.partroi, args.train_partition, args.fold)
+    eval_set = DataLoadAdni(args.choose_data, args.partroi, args.eval_partition, args.fold)
 
-    device = torch.device("cuda" if args.cuda else "cpu")
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=False)
+    eval_loader = DataLoader(eval_set, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, drop_last=False)
+    return train_loader, eval_loader, train_set, eval_set
 
-    example_data, _ = next(iter(train_loader))  # example_data: [B, V, T]
-    V = example_data.shape[1]
-    T = example_data.shape[2]
-    # 3 初始化自定义模型model_hierar
-    # model = model_hierar(args).to(device)
-    print("节点"+str(V)+"时间数"+str(T))
-    model = model_hierar(args, seq_len=T, num_nodes=V).to(device)
-    print(str(model))
 
-    # 4 优化器选择
-    # 当args==0时，选择SGD优化器（随机梯度下降）
-    if args.use_sgd == 0:
-        print("Use SGD")
-        opt = optim.SGD(
-            model.parameters(),  # 模型的所有参数
-            lr=args.lr,  # 学习率
-            momentum=0.9,  # 动量系数，用于加速SGD收敛
-            nesterov=True,  # 启动 Nesterov 加速梯度
-            weight_decay=0.0001)  # L2 正则化，用于防止过拟合
-    else:
-        print("Use Adam")
-        opt = optim.Adam(
-            model.parameters(),
-            lr=args.lr,  # 建议 Adam 用 1e-3 左右
-            betas=(0.9, 0.999),
-            weight_decay=0.0001
-            # amsgrad=True  # 如需可打开
-        )
-    loss_entro = nn.CrossEntropyLoss().cuda()
-    best_test_acc = 0  # 用于记录训练过程中的最佳模型
+def accuracy_from_logits(logits: torch.Tensor, target: torch.Tensor) -> float:
+    pred = logits.argmax(dim=-1)
+    correct = (pred == target).sum().item()
+    total = target.numel()
+    return correct / max(total, 1)
+
+
+# --------------------------- training ----------------------------------------
+
+def train_one_epoch(model, loader, optimizer, device, epoch, args):
+    model.train()
+    total = 0
+    sum_loss = 0.0
+    sum_acc = 0.0
+    # NEW: 分量损失的累计（加权后的值）
+    comp_sums = dict(ce=0.0, bal=0.0, sharp=0.0, intra=0.0, inter=0.0, empty=0.0)
+
+    for x, y in loader:
+        # x: [B, V, T], y: [B]
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True).long()
+
+        # schedule tau by epoch (simple; can be by step if desired)
+        if args.tau_schedule == 'linear':
+            tau = schedule_linear(epoch, start=args.tau_start, end=args.tau_end, total_steps=max(args.epochs-1, 1))
+        else:
+            tau = schedule_cosine(epoch, start=args.tau_start, end=args.tau_end, total_steps=max(args.epochs-1, 1))
+        model.set_tau(tau)
+
+        assign_source = 'soft' if epoch < args.assign_warmup_epochs else 'hard'
+        detach_mask = bool(args.detach_mask)
+
+        out = model(x, assign_source=assign_source, detach_mask=detach_mask, return_tokens=False)
+
+        logits = out['logits']
+        H = out['H']
+        S = out['assign_soft']
+        P = out['alloc_extras']['prototypes']
+        usage = out['alloc_extras']['usage_per_k']
+
+        # --- losses ---
+        L_cls = ce_loss(logits, y, label_smoothing=0.0, class_weights=None, reduction='mean')
+
+        L_balance = balance_loss(usage) * args.lambda_balance
+        L_sharp = sharp_loss(S) * args.lambda_sharp
+        L_intra = intra_compact_loss(H, S, P, metric='l2', normalize=False, detach_P=False) * args.lambda_intra
+        L_inter = inter_separate_loss(P, mode='orth', normalize=True) * args.lambda_inter
+
+        L_empty = torch.tensor(0.0, device=device)
+
+        # NEW: 按 batch 累计（注意乘以 bsz，方便最后求平均）
+        bsz = y.size(0)
+        comp_sums['ce'] += L_cls.item() * bsz
+        comp_sums['bal'] += L_balance.item() * bsz
+        comp_sums['sharp'] += L_sharp.item() * bsz
+        comp_sums['intra'] += L_intra.item() * bsz
+        comp_sums['inter'] += L_inter.item() * bsz
+        comp_sums['empty'] += L_empty.item() * bsz
+
+        if args.lambda_empty > 0.0:
+            # use soft counts to allow gradients to flow to the allocator
+            soft_count = S.sum(dim=1)  # [B,K]
+            L_empty = empty_module_penalty(soft_count, min_count=args.min_count_per_module, mode='hinge') * args.lambda_empty
+
+        loss = L_cls + L_balance + L_sharp + L_intra + L_inter + L_empty
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+
+        if args.clip_grad_norm > 0.0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.clip_grad_norm)
+
+        optimizer.step()
+
+        # metrics
+        bsz = y.size(0)
+        total += bsz
+        sum_loss += loss.item() * bsz
+        sum_acc += accuracy_from_logits(logits, y) * bsz
+
+    #return sum_loss / max(total, 1), sum_acc / max(total, 1)
+    # NEW: 计算分量的 epoch 平均并一起返回
+    for k in comp_sums:
+        comp_sums[k] = comp_sums[k] / max(total, 1)
+    return sum_loss / max(total, 1), sum_acc / max(total, 1), comp_sums
+
+
+@torch.no_grad()
+def evaluate(model, loader, device, epoch, args):
+    model.eval()
+    total = 0
+    sum_loss = 0.0
+    sum_acc = 0.0
+
+    comp_sums = dict(ce=0.0, bal=0.0, sharp=0.0, intra=0.0, inter=0.0, empty=0.0)
+
+    # fix tau & use hard assign at eval
+    model.set_tau(args.tau_eval)
+
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True).long()
+
+        out = model(x, assign_source='hard', detach_mask=True, return_tokens=False)
+
+        logits = out['logits']
+        H = out['H']
+        S = out['assign_soft']
+        P = out['alloc_extras']['prototypes']
+        usage = out['alloc_extras']['usage_per_k']
+
+        L_cls = ce_loss(logits, y, label_smoothing=0.0, class_weights=None, reduction='mean')
+        L_balance = balance_loss(usage) * args.lambda_balance
+        L_sharp = sharp_loss(S) * args.lambda_sharp
+        L_intra = intra_compact_loss(H, S, P, metric='l2', normalize=False, detach_P=False) * args.lambda_intra
+        L_inter = inter_separate_loss(P, mode='orth', normalize=True) * args.lambda_inter
+        bsz = y.size(0)
+        comp_sums['ce'] += L_cls.item() * bsz
+        comp_sums['bal'] += L_balance.item() * bsz
+        comp_sums['sharp'] += L_sharp.item() * bsz
+        comp_sums['intra'] += L_intra.item() * bsz
+        comp_sums['inter'] += L_inter.item() * bsz
+        # comp_sums['empty'] 保持 0.0
+
+        loss = L_cls + L_balance + L_sharp + L_intra + L_inter
+
+        bsz = y.size(0)
+        total += bsz
+        sum_loss += loss.item() * bsz
+        sum_acc += accuracy_from_logits(logits, y) * bsz
+
+    #return sum_loss / max(total, 1), sum_acc / max(total, 1)
+    # NEW
+    for k in comp_sums:
+        comp_sums[k] = comp_sums[k] / max(total, 1)
+    return sum_loss / max(total, 1), sum_acc / max(total, 1), comp_sums
+
+# NEW: 50个epoch保存“每个受试者的节点分配情况”
+@torch.no_grad()
+def save_allocations(model, loader, device, k_modules: int, out_path: str, epoch_idx: int):
+    """
+    迭代 loader（不打乱），对每个受试者输出：
+    受试者N-<标签>：1：[节点列表]   2：[节点列表] ...
+    模块与节点索引均为 1-based；每 50 个 epoch 追加一段。
+    """
+    model.eval()
+    subj_counter = 0
+    label_names = {0: "CN", 1: "Patient"}  # 你可以按需要扩展/修改
+
+    lines = [f"=== Epoch {epoch_idx:03d} ==="]
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True).long()
+
+        out = model(x, assign_source='hard', detach_mask=True, return_tokens=False)
+        Z = out['assign_hard']               # [B,V,K] one-hot（ST 前向）
+        assign_ids = Z.argmax(dim=-1)        # [B,V]  每个节点所属模块（0~K-1）
+
+        B, V = assign_ids.shape
+        for b in range(B):
+            subj_counter += 1
+            label_id = int(y[b].item())
+            label_txt = label_names.get(label_id, str(label_id))
+
+            # 分模块收集该受试者的节点索引（1-based）
+            parts = []
+            for k in range(k_modules):
+                nodes_0 = (assign_ids[b] == k).nonzero(as_tuple=False).view(-1).tolist()
+                nodes_1 = [idx + 1 for idx in nodes_0]  # 转为 1-based
+                parts.append(f"{k+1}：{nodes_1}")
+            line = f"受试者{subj_counter}-{label_txt}：" + "   ".join(parts)
+            lines.append(line)
+
+    # 追加写入
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "a", encoding="utf-8") as f:
+        for ln in lines:
+            f.write(ln + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train modular fMRI model (TimeEncoder + Allocator + MFeature).")
+
+    # data & loader
+    parser.add_argument('--choose_data', type=str, default='ADNI2')
+    parser.add_argument('--partroi', type=int, default=116)
+    parser.add_argument('--fold', type=int, default=0)
+    parser.add_argument('--train_partition', type=str, default='train')
+    parser.add_argument('--eval_partition', type=str, default='test')
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--num_workers', type=int, default=0)
+
+    # model
+    parser.add_argument('--k_modules', type=int, default=8)
+    parser.add_argument('--d_model', type=int, default=64)
+    parser.add_argument('--d_embed', type=int, default=16)
+    parser.add_argument('--use_module_embed', type=int, default=1)
+
+    # training
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--weight_decay', type=float, default=1e-4)
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--save_dir', type=str, default='checkpoints')
+    parser.add_argument('--eval_interval', type=int, default=1)
+
+    # allocator schedule / assignment strategy
+    parser.add_argument('--tau_start', type=float, default=1.8)
+    parser.add_argument('--tau_end', type=float, default=0.5)
+    parser.add_argument('--tau_schedule', type=str, choices=['linear','cosine'], default='cosine')
+    parser.add_argument('--tau_eval', type=float, default=0.5)
+    parser.add_argument('--assign_warmup_epochs', type=int, default=3)
+    parser.add_argument('--detach_mask', type=int, default=1)  # 1=True, 0=False
+
+    # losses (lambdas)
+    parser.add_argument('--lambda_balance', type=float, default=0.2)
+    parser.add_argument('--lambda_sharp', type=float, default=0.1)
+    parser.add_argument('--lambda_intra', type=float, default=0.5)
+    parser.add_argument('--lambda_inter', type=float, default=0.05)
+    parser.add_argument('--lambda_empty', type=float, default=0.0)
+    parser.add_argument('--min_count_per_module', type=float, default=1.0)
+
+    # gradient clipping (switchable): 0 -> disabled
+    parser.add_argument('--clip_grad_norm', type=float, default=1.0)
+
+    args = parser.parse_args()
+
+    set_seed(args.seed)
+    device = torch.device(args.device)
+    print('using device:', device, 'cuda_available:', torch.cuda.is_available())
+    if device.type == 'cuda':
+        print('gpu name:', torch.cuda.get_device_name(torch.cuda.current_device()))
+    # data
+    train_loader, eval_loader, train_set, eval_set = build_dataloaders(args)
+    # infer num_classes from train_set
+    num_classes = count_classes(train_set)
+
+    # model
+    # Need seq_len and num_nodes from a sample
+    sample_x, sample_y = train_set[0]
+    V, T = sample_x.shape
+    model = ModelModular(
+        seq_len=T,
+        num_nodes=V,
+        num_classes=num_classes,
+        k_modules=args.k_modules,
+        d_model=args.d_model,
+        d_embed=args.d_embed,
+        use_module_embed=bool(args.use_module_embed),
+        encoder_kwargs=dict(),      # keep defaults from TimeEncoder
+        allocator_kwargs=dict(),    # keep defaults from Allocator
+        mfeature_kwargs=dict(),     # defaults
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # training loop
+    best_acc = 0.0
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(args.epochs):
-        # 当前epoch的损失：train_loss 样本数量计数器：count
-        train_loss = 0.0
-        count = 0.0
-        # 训练模式，启用dropout等训练时才有的操作
-        model.train()
-        # train_pred和_true存储预测值与真实值
-        train_pred = []
-        train_true = []
-        idx = 0
-        total_time = 0.0
+        #tr_loss, tr_acc = train_one_epoch(model, train_loader, optimizer, device, epoch, args)
+        tr_loss, tr_acc, tr_comp = train_one_epoch(model, train_loader, optimizer, device, epoch, args)
 
-        for data, label in train_loader:
-            # 从loader得到数据
-            data, label = data.to(device), label.to(device).squeeze()
-            batch_size = data.size()[0]
-            start_time = time.time()
-            # 前向传播与损失
-            logits = model(data)  # data输入模型，得到 预测值logits
-            logits = logits.squeeze(1)  # 去除预测值维度为1的部分
-            label = label.to(torch.float32)  # 兼容损失函数
-            loss = loss_entro(logits, label.long()).cuda()  # 计算交叉熵
+        if (epoch + 1) % args.eval_interval == 0 or epoch + 1 == args.epochs:
+            # val_loss, val_acc = evaluate(model, eval_loader, device, epoch, args)
+            val_loss, val_acc, val_comp = evaluate(model, eval_loader, device, epoch, args)
+            #print(f"[Epoch {epoch+1:03d}] "
+            #      f"train_loss={tr_loss:.4f} train_acc={tr_acc:.4f} | "
+            #      f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}")
 
-            # 反向传播
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
+            print(
+                f"[Epoch {epoch + 1:03d}] "
+                f"train_loss={tr_loss:.4f} train_acc={tr_acc:.4f} | "
+                f"(CE={tr_comp['ce']:.4f}, bal={tr_comp['bal']:.4f}, sharp={tr_comp['sharp']:.4f}, "
+                f"intra={tr_comp['intra']:.4f}, inter={tr_comp['inter']:.4f}, empty={tr_comp['empty']:.4f}) | "
+                f"val_loss={val_loss:.4f} "
+                f"(CE={val_comp['ce']:.4f}, bal={val_comp['bal']:.4f}, sharp={val_comp['sharp']:.4f}, "
+                f"intra={val_comp['intra']:.4f}, inter={val_comp['inter']:.4f}) "
+                f"train_acc={tr_acc:.4f} val_acc={val_acc:.4f}"
+            )
+            # NEW: 每 50 个 epoch 保存一次分配情况
+            if (epoch + 1) % 50 == 0:
+                alloc_path = str(save_dir / "allocate.txt")
+                save_allocations(model, eval_loader, device, args.k_modules, alloc_path, epoch + 1)
 
-            end_time = time.time()
-            total_time += (end_time - start_time)
+            if val_acc > best_acc:
+                best_acc = val_acc
+                ckpt = {
+                    'model_state': model.state_dict(),
+                    'optimizer_state': optimizer.state_dict(),
+                    'epoch': epoch,
+                    'best_acc': best_acc,
+                    'args': vars(args),
+                }
+                torch.save(ckpt, save_dir / 'model_best.pt')
 
-            value11, preds = torch.max(logits.data, 1)  # 预测类别：选择维度1上最大的值作为预测值
-
-            count += batch_size
-            train_loss += loss.item() * batch_size  # 累计训练损失
-            # 将标签与预测值从GPU转移到CPU并转换为numpy数组，方便后续计算准确率
-            train_true.append(label.cpu().numpy())
-            train_pred.append(preds.detach().cpu().numpy())
-            idx += 1
-        print('train total time is', total_time)
-        train_true = np.concatenate(train_true)
-        train_pred = np.concatenate(train_pred)
-        outstr = 'Train %d, loss: %.6f, train acc: %.6f' % (
-        epoch, train_loss * 1.0 / count, metrics.accuracy_score(train_true, train_pred))
-        print(outstr)
-        ####################
-        # Test
-        ####################
-        test_loss = 0.0
-        count = 0.0
-        model.eval()
-        test_pred = []
-        test_true = []
-        total_time = 0.0
-        for data, label in test_loader:
-            data, label = data.to(device), label.to(device).squeeze()
-            batch_size = data.size()[0]
-            start_time = time.time()
-            logits = model(data)
-            logits = logits.squeeze(1)
-            label = label.to(torch.float32)
-            loss = loss_entro(logits, label.long()).cuda()
-            value22, preds = torch.max(logits.data, 1)
-            end_time = time.time()
-            total_time += (end_time - start_time)
-            count += batch_size
-            test_loss += loss.item() * batch_size
-            test_true.append(label.cpu().numpy())
-            test_pred.append(preds.detach().cpu().numpy())
-        print('test total time is', total_time)
-        test_true = np.concatenate(test_true)
-        test_pred = np.concatenate(test_pred)
-
-        test_acc = metrics.accuracy_score(test_true, test_pred)
-        outstr = 'Test %d, loss: %.6f,  test acc: %.6f' % (epoch, test_loss * 1.0 / count, test_acc)
-        print(outstr)
-
-        if test_acc >= best_test_acc:
-            best_test_acc = test_acc
-            best_epoch = epoch
-            state = {
-                'epoch': epoch,
-                'acc': best_test_acc,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': opt.state_dict(),
-            }
-            torch.save(state, 'log/%s/models/model.t7' % args.exp_name)
-        outstr = 'best_epoch: %d,best_acc: %.6f' % (best_epoch, best_test_acc)
-        print(outstr)
-    return best_test_acc
+    # save last
+    ckpt = {
+        'model_state': model.state_dict(),
+        'optimizer_state': optimizer.state_dict(),
+        'epoch': args.epochs - 1,
+        'best_acc': best_acc,
+        'args': vars(args),
+    }
+    torch.save(ckpt, save_dir / 'last.pt')
+    print(f"Training finished. Best val acc: {best_acc:.4f}. Checkpoints at: {save_dir}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='HFBN')
-    parser.add_argument('--exp_name', type=str, default='train', metavar='N',
-                        help='Name of the experiment')
-    parser.add_argument('--batch_size', type=int, default=16, metavar='batch_size',
-                        help='Size of batch)')
-    parser.add_argument('--test_batch_size', type=int, default=30, metavar='batch_size',
-                        help='Size of batch)')
-    parser.add_argument('--epochs', type=int, default=299, metavar='N',
-                        help='number of episode to train ')
-    parser.add_argument('--use_sgd', type=int, default=0,
-                        help='Use SGD')
-    parser.add_argument('--lr', type=float, default=0.1, metavar='LR',
-                        help='learning rate (default: 0.001, 0.1 if using sgd)')
-    parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
-                        help='SGD momentum (default: 0.9)')
-    parser.add_argument('--no_cuda', type=bool, default=False,
-                        help='enables CUDA training')
-    parser.add_argument('--seed', type=int, default=1, metavar='S',
-                        help='random seed (default: 1)')
-    parser.add_argument('--eval', type=bool, default=False,
-                        help='evaluate the model')
-    parser.add_argument('--dropout', type=float, default=0.5,
-                        help='dropout rate')
-    parser.add_argument('--model_path', type=str, default='', metavar='N')
-    parser.add_argument('--Num', type=int, default=0, help=' ')
-    parser.add_argument('--adni', type=int, default=2, choices=[2, 3])
-    parser.add_argument('--kernel', type=int, default=9)
-    parser.add_argument('--partroi', type=int, default=270)
-    parser.add_argument('--log_dir', type=str, default='output', help='experiment root')
-    parser.add_argument('--Gbias', type=bool, default=False, help='if bias ')
-    parser.add_argument('--num_pooling', type=int, default=1, help=' ')
-    parser.add_argument('--embedding_dim', type=int, default=90, help=' ')
-    parser.add_argument('--assign_ratio', type=float, default=0.35, help=' ')
-    parser.add_argument('--assign_ratio_1', type=float, default=0.35, help=' ')
-    parser.add_argument('--mult_num', type=int, default=8, help=' ')
-    parser.add_argument('--data_choose', type=str, default='adni2', help='choose model:adni2 or adni3')
-    parser.add_argument('--fold_list', default=[3], help='fold = 0,1,2,3,4')
-
-    allaccu = []
-    all_result = []
-    args = parser.parse_args()
-    # 3. 设置实验目录和模型路径
-    fold_list = args.fold_list  # 获取交叉验证的折数列表
-    for i in fold_list:  # 循环遍历每个折数（交叉验证的每个划分）
-        i = int(i)
-        fold = i
-        args = parser.parse_args()
-
-        args.exp_name = str(args.log_dir) + '/' + 'adni' + str(args.adni) + '_roi' + str(args.partroi) + '_pool' + str(
-            args.num_pooling) + '_fold' + str(i + 1) + '/' + args.exp_name
-        args.model_path = str(args.log_dir) + '/' + 'adni' + str(args.adni) + '_roi' + str(
-            args.partroi) + '_pool' + str(args.num_pooling) + '_fold' + str(i + 1) + '/models/model.t7'
-        _init_()
-        args.cuda = not args.no_cuda and torch.cuda.is_available()
-
-        if args.cuda:
-            print(
-                'Using GPU : ' + str(torch.cuda.current_device()) + ' from ' + str(
-                    torch.cuda.device_count()) + ' devices')
-        else:
-            print('Using CPU')
-        if not args.eval:
-            accu = train(args, fold)
-        allaccu.append(accu)
-
-    array = np.array(allaccu)
-    print('Accuracy summary:')
-    print(np.mean(array, axis=0))
-
-    with open('log/adni_{}_roi_{}_log.txt'.format(args.adni, args.partroi), 'a') as f:
-        print('*************:', file=f)
-        print('adni' + str(args.adni) + '_roi' + str(args.partroi) + '_lr' + str(args.lr) + '_BS' + str(
-            args.batch_size) + '_pool' + str(args.num_pooling) + '_rate' + str(args.assign_ratio) + ':', file=f)
-        print(array, file=f)
-        print('Accuracy summary:', file=f)
-        print(np.mean(array, axis=0), file=f)
-
+    main()
