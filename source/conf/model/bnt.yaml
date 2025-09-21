@@ -8,14 +8,36 @@ freeze_center: true
 project_assignment: true
 pos_embed_dim: 360
 
-# 👉 这些键与上面同级，不要再包一层 model:
-encoder: modular           # vanilla | modular
-module_map_path: D:\code\BrainNetworkTransformer-main\source\conf\dataset\group_modules_k7.npy
-fuse: concat               # gate | sum | concat
+
+model:
+encoder: modular         # 仍然叫 modular；也可自定义名字
+fuse: gate               # gate | concat
 gate:
-  granularity: global
+  granularity: node      # global | node
+  hidden: 1              # 0=线性门控；>0=两层MLP
+  dropout: 0.99
 entmax:
-  alpha: 1.3
+  alpha: 1.2             # 1.2~1.5 常用
 film:
   dim: 64
-  place: pre_qkv
+  # 下面两个会被透传到 TwoBranchEncoderLayer，确保与原版一致
+dropout: 0.1
+hidden_size: 1024        # 这会作为 dim_feedforward 传下去
+module_map_path: D:\code\BrainNetworkTransformer-main\source\conf\dataset\group_modules_k7_zero_based.npy
+
+## 👉 这些键与上面同级，不要再包一层 model:
+#encoder: modular           # vanilla | modular
+## module_map_path: D:\code\BrainNetworkTransformer-main\source\conf\dataset\group_modules_k7.npy
+#module_map_path: D:\code\BrainNetworkTransformer-main\source\conf\dataset\group_modules_k7_zero_based.npy
+#fuse: sum_eq            # gate | sum | concat  sum_eq
+#gate:
+#  granularity: node  # global  node
+#entmax:
+#  alpha: 1.001
+#film:
+#  dim: 64
+#  place: pre_qkv
+#
+#attn_dropout: 0.05
+#ffn_dropout: 0.1
+#gate_dropout: 0.0      # 或 0.05；别一开始就大

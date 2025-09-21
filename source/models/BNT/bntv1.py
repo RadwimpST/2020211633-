@@ -1,15 +1,15 @@
 import torch
 import torch.nn as nn
 from torch.nn import TransformerEncoderLayer
-
-from .components.transformer_encoder import ModularTransformerEncoder
 from .ptdec import DEC
 from typing import List
 from .components import InterpretableTransformerEncoder
 from omegaconf import DictConfig
 from ..base import BaseModel
-from typing import List, Optional, Dict, Any   # ← 加这行
-import numpy as np  # ← NEW
+
+import numpy as np  # NEW
+from .components.transformer_encoder import ModularTransformerEncoder  # NEW（你刚新增的编码器）
+
 
 class TransPoolingEncoder(nn.Module):
     """
@@ -19,65 +19,48 @@ class TransPoolingEncoder(nn.Module):
     """
 
     def __init__(
-            self,
-            input_feature_size,
-            input_node_num,
-            hidden_size,
-            output_node_num,
-            pooling=True,
-            orthogonal=True,
-            freeze_center=False,
-            project_assignment=True,
-            # ====== NEW: modular 相关可选参数 ======
-            use_modular: bool = False,
-            modular_kwargs: Optional[Dict[str, Any]] = None,
-            attn_mask_intra: Optional[torch.Tensor] = None,
-            attn_mask_inter: Optional[torch.Tensor] = None,
-            mods_index: Optional[torch.Tensor] = None,
+        self,
+        input_feature_size,
+        input_node_num,
+        hidden_size,
+        output_node_num,
+        pooling=True,
+        orthogonal=True,
+        freeze_center=False,
+        project_assignment=True,
+        # ===== NEW: modular 相关可选参数 =====
+        use_modular: bool = True,
+        modular_kwargs: dict = None,
+        attn_mask_intra: torch.Tensor = None,
+        attn_mask_inter: torch.Tensor = None,
+        mods_index: torch.Tensor = None,
     ):
         super().__init__()
-        # ====== NEW: 缓存 modular 配置，避免“未解析的引用” ======
-        self.use_modular = bool(use_modular)
-        self.modular_kwargs = modular_kwargs or {}
-        mk = self.modular_kwargs
+        self.use_modular = use_modular
 
-        if self.use_modular:
-            # 与原版骨架一致的“两路编码器”（Post-LN + FFN=hidden_size）
+        modular_kwargs = modular_kwargs or {}
+
+        if use_modular:
+            # 你在 components/transformer_encoder.py 里实现的两路编码器
             self.transformer = ModularTransformerEncoder(
                 d_model=input_feature_size,
-                nhead=mk.get("nhead", 4),
-                num_layers=1,
-                dim_feedforward=hidden_size,  # 与 InterpretableTransformerEncoder 对齐
-                dropout=mk.get("dropout", 0.1),
-                entmax_alpha=mk.get("entmax_alpha", 1.3),
-                film_dim=mk.get("film_dim", 64),
-                fuse=mk.get("fuse", "gate"),  # "gate" | "concat"
-                gate_granularity=mk.get("gate_granularity", "global"),  # "global" | "node"
-                gate_hidden=mk.get("gate_hidden", 0),
-                gate_dropout=mk.get("gate_dropout", 0.0),
+                nhead=modular_kwargs.get("nhead", 4),
+                num_layers=1,                              # 与原先单层 InterpretableTransformerEncoder 对齐
+                entmax_alpha=modular_kwargs.get("entmax_alpha", 1.3),
+                film_dim=modular_kwargs.get("film_dim", 64),
+                film_place=modular_kwargs.get("film_place", "pre_qkv"),
+                fuse=modular_kwargs.get("fuse", "gate"),
+                gate_granularity=modular_kwargs.get("gate_granularity", "global"),
+                dropout=modular_kwargs.get("dropout", 0.1),
             )
-            # 必要参数检查
-            if (attn_mask_intra is None) or (attn_mask_inter is None) or (mods_index is None):
-                raise ValueError("use_modular=True 需要传入 attn_mask_intra, attn_mask_inter, mods_index")
-
-            # 允许传 [N] 或 [B,N] → 统一存成 [1,N]，forward 时按 batch 扩展
-            mods_index = mods_index.to(torch.long)
-            mods_buf = mods_index.unsqueeze(0) if mods_index.dim() == 1 else mods_index
-            self.register_buffer("mods_index", mods_buf)  # [1,N] 或 [B,N]
-            self.register_buffer("attn_mask_intra", attn_mask_intra.to(torch.float))  # (N,N) 或 (B,N,N)
+            assert mods_index is not None and attn_mask_intra is not None and attn_mask_inter is not None
+            self.register_buffer("mods_index", mods_index.to(torch.long))  # long 索引
+            self.register_buffer("attn_mask_intra", attn_mask_intra.to(torch.float))  # additive mask: 允许=0, 禁止=-1e9
             self.register_buffer("attn_mask_inter", attn_mask_inter.to(torch.float))
-
-            # 让 FiLM 知道真实模块数 K（标签一般 1..K）
-            try:
-                K = int(mods_index.max().item())
-                self.transformer.set_num_modules(K)
-            except Exception:
-                pass
         else:
-            # 原版单路 Transformer（保持不变）
+            # 原版编码器（保持不变）
             self.transformer = InterpretableTransformerEncoder(
-                d_model=input_feature_size,
-                nhead=4,
+                d_model=input_feature_size, nhead=4,
                 dim_feedforward=hidden_size,
                 batch_first=True
             )
@@ -86,13 +69,11 @@ class TransPoolingEncoder(nn.Module):
         if pooling:
             encoder_hidden_size = 32
             self.encoder = nn.Sequential(
-                nn.Linear(input_feature_size *
-                          input_node_num, encoder_hidden_size),
+                nn.Linear(input_feature_size * input_node_num, encoder_hidden_size),
                 nn.LeakyReLU(),
                 nn.Linear(encoder_hidden_size, encoder_hidden_size),
                 nn.LeakyReLU(),
-                nn.Linear(encoder_hidden_size,
-                          input_feature_size * input_node_num),
+                nn.Linear(encoder_hidden_size, input_feature_size * input_node_num),
             )
             self.dec = DEC(cluster_number=output_node_num, hidden_dimension=input_feature_size, encoder=self.encoder,
                            orthogonal=orthogonal, freeze_center=freeze_center, project_assignment=project_assignment)
@@ -102,13 +83,11 @@ class TransPoolingEncoder(nn.Module):
 
     def forward(self, x):
         if self.use_modular:
-            B = x.size(0)
-            mods = self.mods_index if self.mods_index.size(0) == B else self.mods_index.expand(B, -1)
             x = self.transformer(
                 x,
-                attn_mask_intra=self.attn_mask_intra,  # (N,N) 或 (B,N,N)
+                attn_mask_intra=self.attn_mask_intra,
                 attn_mask_inter=self.attn_mask_inter,
-                mods=mods  # (B,N)
+                mods=self.mods_index
             )
         else:
             x = self.transformer(x)
@@ -119,10 +98,12 @@ class TransPoolingEncoder(nn.Module):
         return x, None
 
     def get_attention_weights(self):
-        return self.transformer.get_attention_weights()
+        # 兼容：如果 modular 编码器没实现可视化接口，就返回 None
+        return getattr(self.transformer, "get_attention_weights", lambda: None)()
 
     def loss(self, assignment):
         return self.dec.loss(assignment)
+
 
 
 class BrainNetworkTransformer(BaseModel):
@@ -141,28 +122,30 @@ class BrainNetworkTransformer(BaseModel):
             forward_dim = config.dataset.node_sz + config.model.pos_embed_dim
             nn.init.kaiming_normal_(self.node_identity)
 
-        # ====== NEW: 是否启用 modular（按配置开关）======
-        self.use_modular = (getattr(config.model, "encoder", "vanilla") == "modular")
-        mods_t = None
-        attn_mask_intra = None
-        attn_mask_inter = None
+        # ===== NEW: modular 编码器所需的模块映射与掩码 =====
+        self.use_modular = getattr(config.model, "encoder", "vanilla") == "modular"
         if self.use_modular:
-            # 从配置加载节点→模块映射（[N], 取值 1..K）
-            mods = np.load(config.model.module_map_path).astype(np.int64)
+            mods = np.load(config.model.module_map_path).astype(np.int64)  # [N], 1..K
             assert mods.shape[0] == config.dataset.node_sz, \
                 f"module map length={mods.shape[0]} != node_sz={config.dataset.node_sz}"
-            mods_t = torch.from_numpy(mods)  # [N]
+            mods_t = torch.from_numpy(mods)
 
-            # 模块内：同模块允许（含自环）
-            N = mods_t.shape[0]
+            # intra：同模块允许（含自环）；inter：跨模块允许（禁自环）
             M_intra = (mods_t[:, None] == mods_t[None, :]).float()
+            M_inter = 1.0 - M_intra
             M_intra.fill_diagonal_(1.0)
-            attn_mask_intra = (1.0 - M_intra) * (-1e9)
+            M_inter.fill_diagonal_(1.0)
 
-            # 模块间：如果你要“允许所有节点交互”，用全 0 掩码：
+            # additive mask（允许=0，禁止=-1e9）
+            attn_mask_intra = (1.0 - M_intra) * (-1e9)
+            attn_mask_inter = (1.0 - M_inter) * (-1e9)
             attn_mask_inter = torch.zeros_like(M_intra, dtype=torch.float32)
-            # 若想“只允许跨模块”（禁自环），改为：
-            # M_inter = 1.0 - M_intra; attn_mask_inter = (1.0 - M_inter) * (-1e9)
+            # # 缓存为 buffer（随 .to(device) 一起迁移）
+            # self.register_buffer("attn_mask_intra", attn_mask_intra)
+            # self.register_buffer("attn_mask_inter", attn_mask_inter)
+            # self.register_buffer
+
+
 
         sizes = config.model.sizes
         sizes[0] = config.dataset.node_sz
@@ -170,7 +153,7 @@ class BrainNetworkTransformer(BaseModel):
         do_pooling = config.model.pooling
         self.do_pooling = do_pooling
         for index, size in enumerate(sizes):
-            use_mod = bool(self.use_modular and index == 0)  # 仅第一层用两路编码器
+            use_mod = bool(self.use_modular and index == 0)  # 只在第一层使用两路编码器
             self.attention_list.append(
                 TransPoolingEncoder(
                     input_feature_size=forward_dim,
@@ -181,23 +164,26 @@ class BrainNetworkTransformer(BaseModel):
                     orthogonal=config.model.orthogonal,
                     freeze_center=config.model.freeze_center,
                     project_assignment=config.model.project_assignment,
-                    # ====== NEW: modular 相关参数（仅第一层传）======
+                    # ===== NEW: 仅第一层传 modular 相关参数 =====
                     use_modular=use_mod,
                     modular_kwargs=dict(
                         nhead=4,
-                        dropout=getattr(config.model, "dropout", 0.1),
-                        entmax_alpha=getattr(getattr(config.model, "entmax", {}), "alpha", 1.3),
-                        film_dim=getattr(getattr(config.model, "film", {}), "dim", 64),
+                        entmax_alpha=getattr(config.model, "entmax", {}).get("alpha", 1.3),
+                        film_dim=getattr(config.model, "film", {}).get("dim", 64),
+                        film_place=getattr(config.model, "film", {}).get("place", "pre_qkv"),
                         fuse=getattr(config.model, "fuse", "gate"),
                         gate_granularity=getattr(getattr(config.model, "gate", {}), "granularity", "global"),
-                        gate_hidden=getattr(getattr(config.model, "gate", {}), "hidden", 0),
-                        gate_dropout=getattr(getattr(config.model, "gate", {}), "dropout", 0.0),
+                        dropout=0.1,
                     ) if use_mod else None,
-                    attn_mask_intra=attn_mask_intra if use_mod else None,
-                    attn_mask_inter=attn_mask_inter if use_mod else None,
-                    mods_index=mods_t if use_mod else None,
+                    # attn_mask_intra=self.attn_mask_intra if use_mod else None,
+                    # attn_mask_inter=self.attn_mask_inter if use_mod else None,
+                    # mods_index=self.mods_index if use_mod else None,
+                    attn_mask_intra=attn_mask_intra,
+                    attn_mask_inter=attn_mask_inter,
+                    mods_index=mods_t,
                 )
             )
+
 
         self.dim_reduction = nn.Sequential(
             nn.Linear(forward_dim, 8),
