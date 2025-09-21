@@ -37,6 +37,7 @@ class TransPoolingEncoder(nn.Module):
     ):
         super().__init__()
         self.use_modular = use_modular
+
         modular_kwargs = modular_kwargs or {}
 
         if use_modular:
@@ -52,12 +53,10 @@ class TransPoolingEncoder(nn.Module):
                 gate_granularity=modular_kwargs.get("gate_granularity", "global"),
                 dropout=modular_kwargs.get("dropout", 0.1),
             )
-            # 把 mask / mods 作为 buffer 缓存，随 .to(device) 自动迁移
-            assert attn_mask_intra is not None and attn_mask_inter is not None and mods_index is not None, \
-                "use_modular=True 时需提供 attn_mask_intra/inter 与 mods_index"
-            self.register_buffer("attn_mask_intra", attn_mask_intra)
-            self.register_buffer("attn_mask_inter", attn_mask_inter)
-            self.register_buffer("mods_index", mods_index)
+            assert mods_index is not None and attn_mask_intra is not None and attn_mask_inter is not None
+            self.register_buffer("mods_index", mods_index.to(torch.long))  # long 索引
+            self.register_buffer("attn_mask_intra", attn_mask_intra.to(torch.float))  # additive mask: 允许=0, 禁止=-1e9
+            self.register_buffer("attn_mask_inter", attn_mask_inter.to(torch.float))
         else:
             # 原版编码器（保持不变）
             self.transformer = InterpretableTransformerEncoder(
@@ -141,10 +140,11 @@ class BrainNetworkTransformer(BaseModel):
             attn_mask_intra = (1.0 - M_intra) * (-1e9)
             attn_mask_inter = (1.0 - M_inter) * (-1e9)
 
-            # 缓存为 buffer（随 .to(device) 一起迁移）
-            self.register_buffer("attn_mask_intra", attn_mask_intra)
-            self.register_buffer("attn_mask_inter", attn_mask_inter)
-            self.register_buffer("mods_index", mods_t)
+            # # 缓存为 buffer（随 .to(device) 一起迁移）
+            # self.register_buffer("attn_mask_intra", attn_mask_intra)
+            # self.register_buffer("attn_mask_inter", attn_mask_inter)
+            # self.register_buffer
+
 
 
         sizes = config.model.sizes
@@ -175,9 +175,12 @@ class BrainNetworkTransformer(BaseModel):
                         gate_granularity=getattr(getattr(config.model, "gate", {}), "granularity", "global"),
                         dropout=0.1,
                     ) if use_mod else None,
-                    attn_mask_intra=self.attn_mask_intra if use_mod else None,
-                    attn_mask_inter=self.attn_mask_inter if use_mod else None,
-                    mods_index=self.mods_index if use_mod else None,
+                    # attn_mask_intra=self.attn_mask_intra if use_mod else None,
+                    # attn_mask_inter=self.attn_mask_inter if use_mod else None,
+                    # mods_index=self.mods_index if use_mod else None,
+                    attn_mask_intra=attn_mask_intra,
+                    attn_mask_inter=attn_mask_inter,
+                    mods_index=mods_t,
                 )
             )
 

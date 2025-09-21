@@ -130,6 +130,7 @@ class FiLM(nn.Module):
         x: [B,N,d]; mods: [N] （群体模板，批内所有样本相同）
         返回 γ⊙x + β，γ=1+Δγ
         """
+        mods = mods.to(self.embed.weight.device)
         B, N, d = x.shape
         h = self.embed(mods)           # [N,film_dim]
         gb = self.mlp(h)               # [N,2d]
@@ -137,6 +138,8 @@ class FiLM(nn.Module):
         gamma = 1.0 + gamma            # 初始化≈1
         gamma = gamma.unsqueeze(0).expand(B, N, d)
         beta  = beta.unsqueeze(0).expand(B, N, d)
+
+
         return gamma * x + beta
 
 # ========== 两路编码器层 + 融合 ==========
@@ -173,6 +176,8 @@ class ModularEncoderLayer(nn.Module):
     def forward(self, x, attn_mask_intra, attn_mask_inter, mods):
         # Pre-LN
         y = self.norm1(x)
+        attn_mask_intra = attn_mask_intra.to(y.device, dtype=y.dtype)
+        attn_mask_inter = attn_mask_inter.to(y.device, dtype=y.dtype)
 
         # Intra 分支：FiLM + MHA(intra mask)
         y_intra = self.film(y, mods)
@@ -192,6 +197,7 @@ class ModularEncoderLayer(nn.Module):
         # 残差 + FFN
         x = x + self.dropout(z)
         x = x + self.dropout(self.ffn(self.norm2(x)))
+
         return x
 
 class ModularTransformerEncoder(nn.Module):
@@ -212,5 +218,7 @@ class ModularTransformerEncoder(nn.Module):
             if isinstance(layer.film, FiLM) and layer.film.embed.num_embeddings == 10000:
                 K = int(mods.max().item())
                 layer.set_num_modules(K)
+                layer.film = layer.film.to(x.device)  # ★ 新增：把刚创建的 FiLM 挪到和 x 相同的设备
             x = layer(x, attn_mask_intra, attn_mask_inter, mods)
+
         return x

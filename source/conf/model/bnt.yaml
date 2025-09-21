@@ -1,20 +1,21 @@
 # seq, gnn, fbnetgen
 name: BrainNetworkTransformer
-sizes: [360, 100]  # Note: The input node size should not be included here
+sizes: [360, 100]
 pooling: [false, true]
-pos_encoding: none  # identity, none
+pos_encoding: none
 orthogonal: true
 freeze_center: true
 project_assignment: true
 pos_embed_dim: 360
-model:
-  encoder: modular           # vanilla | modular
-  module_map_path: "D:\\code\\BrainNetworkTransformer-main\\source\\conf\\dataset\\group_modules_k7.npy"
-  fuse: concat               # gate | sum | concat
-  gate:
-    granularity: global      # 先全局门，后续再试 per_module/per_node
-  entmax:
-    alpha: 1.3
-  film:
-    dim: 64
-    place: pre_qkv
+
+# 👉 这些键与上面同级，不要再包一层 model:
+encoder: modular           # vanilla | modular
+module_map_path: D:\code\BrainNetworkTransformer-main\source\conf\dataset\group_modules_k7.npy
+fuse: concat               # gate | sum | concat
+gate:
+  granularity: global
+entmax:
+  alpha: 1.3
+film:
+  dim: 64
+  place: pre_qkv
